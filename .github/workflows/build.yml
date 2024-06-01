@@ -78,8 +78,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-20.04, ubuntu-22.04, ubuntu-24.04, macos-11, macos-arm-oss ]
+        os: [ ubuntu-20.04, ubuntu-22.04, ubuntu-24.04 ]
+        # os: [ ubuntu-20.04, ubuntu-22.04, ubuntu-24.04, macos-11, macos-arm-oss ]
         name: [ head, debug ]
+        include:
+          - os: ubuntu-22.04
+            name: asan
     runs-on: ${{ matrix.os }}
     steps:
     - name: Clone ruby
@@ -95,12 +99,14 @@ jobs:
         platform=${platform/macos-11/macos-latest}
         platform=${platform/macos-arm-oss/macos-13-arm64}
         echo "platform=$platform" >> $GITHUB_OUTPUT
+        # Prefix where the installed ruby will eventually go (this gets tar'd up to be distributed)
+        echo "RUBY_PREFIX=$HOME/.rubies/ruby-${{ matrix.name }}" >> $GITHUB_ENV
 
     # Build
     - name: apt-get update on Ubuntu
       run: sudo apt-get update
       if: startsWith(matrix.os, 'ubuntu')
-    - run: sudo apt-get install -y --no-install-recommends ruby bison libyaml-dev libgdbm-dev libreadline-dev libncurses5-dev
+    - run: sudo apt-get install -y --no-install-recommends ruby bison libyaml-dev libgdbm-dev libreadline-dev libncurses5-dev patch
       if: startsWith(matrix.os, 'ubuntu')
     - run: brew install autoconf automake bison
       if: startsWith(matrix.os, 'macos')
@@ -118,6 +124,9 @@ jobs:
       with:
         ruby-version: 3.2
 
+    - run: chmod 755 $HOME # https://github.com/actions/virtual-environments/issues/267
+    - run: mkdir -p ~/.rubies
+
     # ENABLE_PATH_CHECK=0: https://github.com/actions/virtual-environments/issues/267
     - name: Set configure flags (head)
       run: |
@@ -129,13 +138,80 @@ jobs:
         echo "optflags=-O3 -fno-inline" >> $GITHUB_ENV
       if: matrix.name == 'debug'
 
+    - name: Install Clang 18
+      run: |
+        set -ex;
+        wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+        sudo add-apt-repository -y 'deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main'
+        sudo apt update -y
+        sudo apt install -y clang-18
+      if: matrix.name == 'asan'
+    - name: Set global configure flags (asan)
+      run: |
+        # These flags get applied to both the Ruby compilation _and_ the compilation of dependencies
+        # wiht ASAN enabled
+        echo "optflags=-O3 -fno-inline -fno-omit-frame-pointer" >> $GITHUB_ENV
+        # Compile with ASAN
+        echo "debugflags=-fsanitize=address -ggdb3 -fPIC" >> $GITHUB_ENV
+        # Requires clang 18
+        echo "CC=clang-18" >> $GITHUB_ENV
+      if: matrix.name == 'asan'
+    - name: Build ASAN dependencies (asan)
+      run: |
+        set -ex
+        # Where we're going to store ASAN static archives (these need to be distributed, since the LDFLAGS
+        # we need to use to link Ruby against them get burned into the resulting rbconfig)
+        mkdir -p "$RUBY_PREFIX/asan"
+        mkdir asan_build
+        pushd asan_build
+
+        OPENSSL_VERSION="3.3.0"
+        LIBYAML_VERSION="0.2.5"
+
+        # Make sure we compile OpenSSL to look for certificates in the same place that the
+        # distribution provided OpenSSl would.
+        OPENSSLDIR="$(openssl version -d | ruby -rshellwords -ne 'if $_ =~ /OPENSSLDIR:(.*)$/; puts Shellwords.shellsplit($1.strip); end')"
+
+        curl -fsSLO "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
+        tar xf "openssl-${OPENSSL_VERSION}.tar.gz"
+        pushd "openssl-${OPENSSL_VERSION}"
+        ./Configure --prefix="$RUBY_PREFIX/asan" --libdir=lib --openssldir="$OPENSSLDIR" no-shared no-tests no-apps CC="$CC" CFLAGS="$optflags $debugflags"
+        make -j4
+        # make install_sw will try and write config to OPENSSLDIR, which we don't want to do.
+        mkdir -p "$RUBY_PREFIX/asan/lib"
+        cp libcrypto.a libssl.a "$RUBY_PREFIX/asan/lib"
+        popd
+
+        curl -fsSLO "http://pyyaml.org/download/libyaml/yaml-${LIBYAML_VERSION}.tar.gz"
+        tar xf "yaml-${LIBYAML_VERSION}.tar.gz"
+        pushd "yaml-${LIBYAML_VERSION}"
+        ./configure --prefix="$RUBY_PREFIX/asan" --disable-shared --enable-static CC="$CC" CFLAGS="$optflags $debugflags"
+        make -j4
+        make install
+        popd
+
+        popd
+        rm -Rf asan_build
+      if: matrix.name == 'asan'
+    - name: Set Ruby configure flags (asan)
+      run: |
+        # These flags get applied only to the Ruby build, not to the libs.
+        # Clang > 17 does not work with M:N threading: https://bugs.ruby-lang.org/issues/20243
+        echo "cppflags=-DENABLE_PATH_CHECK=0 -DRUBY_DEBUG=1 -DVM_CHECK_MODE=1 -DUSE_MN_THREADS=0" >> $GITHUB_ENV
+        # And statically link against our ASAN-compiled libraries
+        echo "LDFLAGS=-L${RUBY_PREFIX}/asan/lib -Wl,-Bstatic -lcrypto -lssl -lyaml -Wl,-Bdynamic" >> $GITHUB_ENV
+        echo "cflags=-I${RUBY_PREFIX}/asan/include" >> $GITHUB_ENV
+
+        # Make the test timeouts more generous too (ASAN is slower)
+        echo "RUBY_TEST_TIMEOUT_SCALE=5" >> $GITHUB_ENV
+        echo "SYNTAX_SUGGEST_TIMEOUT=600" >> $GITHUB_ENV
+      if: matrix.name == 'asan'
+
     # Build
-    - run: chmod 755 $HOME # https://github.com/actions/virtual-environments/issues/267
-    - run: mkdir -p ~/.rubies
     - run: ./autogen.sh
-    - run: ./configure --prefix=$HOME/.rubies/ruby-${{ matrix.name }} --enable-shared --disable-install-doc --enable-yjit
+    - run: ./configure --prefix="$RUBY_PREFIX" --enable-shared --disable-install-doc --enable-yjit
       if: startsWith(matrix.os, 'ubuntu')
-    - run: ./configure --prefix=$HOME/.rubies/ruby-${{ matrix.name }} --enable-shared --disable-install-doc --enable-yjit --with-openssl-dir=$(brew --prefix openssl@1.1) --with-readline-dir=$(brew --prefix readline)
+    - run: ./configure --prefix="$RUBY_PREFIX" --enable-shared --disable-install-doc --enable-yjit --with-openssl-dir=$(brew --prefix openssl@1.1) --with-readline-dir=$(brew --prefix readline)
       if: startsWith(matrix.os, 'macos')
     - run: make -j4
     - run: make install
